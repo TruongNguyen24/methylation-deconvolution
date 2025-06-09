@@ -1,2 +1,4 @@
 # methylation-deconvolution
-The assignment for post-doc position at TOBI lab
+## Using Methylation Atlas Deconvolution: nloyfer/meth_atlas 
+
+
