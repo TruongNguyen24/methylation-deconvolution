@@ -1,0 +1,697 @@
+---
+title: "Cell deconvolution"
+author: "Truong Nguyen"
+date: "2025-06-07"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Loading packages
+
+```{r loading library}
+#BiocManager::install("FlowSorted.Blood.450k")
+#BiocManager::install("methylCC")
+library(FlowSorted.Blood.450k)
+library(methylCC)
+library(minfi)
+library(tidyr)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(tidyverse)
+library(data.table)
+library(compositions)   
+library(FactoMineR)     
+library(factoextra)   
+library(vegan)         
+library(cluster)       
+library(umap)         
+library(pheatmap)
+library(RColorBrewer)
+library(gghalves)
+library(rpart)
+library(rpart.plot)
+library(devtools)
+library(abind)
+library(sesame)
+library(rtracklayer)
+library(dplyr)
+library(magrittr)
+library(S4Vectors)
+library(methylkey)
+library(DT)
+library(SummarizedExperiment)
+library(limma) 
+library(ggrepel)
+library(GenomicRanges)
+library(ggpubr)
+library(DMRcate)
+```
+
+# Loading data
+
+```{r loading datasets}
+bulk_sample <- read.csv("/Users/macos/Desktop/Job_applications/VIB/Meth_atlas/bulk_samples.csv", stringsAsFactors = FALSE)
+dim(bulk_sample)
+
+reference_sample <- read.csv("/Users/macos/Desktop/Job_applications/VIB/Meth_atlas/reference_samples.csv", stringsAsFactors = FALSE)
+dim(reference_sample)
+
+```
+
+# Loading cell deconvolution results
+
+These downstream analyses were performed on the results of cell deconvolution using deconvolve.py (nloyfer/meth_atlas)
+
+```{r loading decon results}
+fractions_file <- "/Users/macos/Desktop/Job_applications/VIB/Meth_atlas/bulk_samples_deconv_output.csv" 
+frac <- fread(fractions_file) |> column_to_rownames("V1") |> as.matrix()
+residuals_file <- "/Users/macos/Desktop/Job_applications/VIB/Meth_atlas/bulk_samples_residuals.csv" 
+resid <- fread(residuals_file) |> column_to_rownames("V1") |> pull(Residuals)
+```
+
+# Descriptive plots
+
+Cellular proportions (which sum to 1) were treated as compositional data and normalized by centered log-ratio (CLR) transformation. Euclidean distances on the CLR-transformed abundances were then used to cluster the samples. Dimensionality reduction by PCA and UMAP both supported two main clusters (k-silhouette analysis, k = 2):
+    Cluster 1: immune-rich (Neutrophiles + Monocytes high prevalence)
+    Cluster 2: non-immune or atlas others.
+    
+Decision tree provided a simple way to explain the clustering: IF B >= 0.0055 --> Cluster 1; else if Mono < 0.078 --> Cluster 1; else Cluster 2 
+
+Using Shannon diversity to assess the heterogeneity of 2 clusters: Cluster 1 is more heterogeneous (Median entropy = 1.9 vs 1.1 of cluster 2; two-sided Wilcoxon test, p = 0.007), suggesting mixed or inflammed samples.  
+
+```{r Descriptive plots}
+
+#############################################################
+##      1.  Cell proportions from deconvolve.py            ##
+#############################################################
+
+# transposed version is convenient for sample-level ops
+frac_t <- t(frac) 
+
+# Fast check
+## 1-A: do fractions sum to ~1?
+round(rowSums(frac_t), 3) |> summary()
+
+## 1-B: “other” row vs residuals
+if (exists("resid") && "other" %in% rownames(frac)) {
+  df_tmp <- tibble(other = frac["other", ],
+                   residual = resid)
+  ggplot(df_tmp, aes(residual, other)) +
+    geom_point() + geom_smooth(method = "lm") +
+    ggtitle("Samples with high residuals are dominated by 'other'?")
+}
+
+# Descriptive plots
+## 2-A: stacked bar
+
+frac_long <- frac_t |>
+  as.data.frame()              |>          
+  rownames_to_column("Sample") |>         
+  pivot_longer(-Sample,
+               names_to  = "Cell",
+               values_to = "Fraction")
+
+ggplot(frac_long, aes(Sample, Fraction, fill = Cell)) +
+  geom_bar(stat = "identity", width = 0.9) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(title = "Cell-type composition of 50 samples")
+
+## 2-B: violin per cell type
+
+ggplot(frac_long, aes(x = Cell, y = Fraction, color = Cell)) +
+  # violins outlined in colour, no fill
+  geom_half_violin(side = "r", trim = TRUE, fill = NA, size = 0.5, alpha = 0.4) +
+  # boxplots outlined in same colour, no fill
+  geom_boxplot(width = 0.1, fill = NA, size = 1.2, outlier.shape = NA, alpha =1) +
+  # optional: overlay points with matching border colour
+  geom_jitter(width = 0.2, size = 1.2, alpha = 0.3, shape = 21, aes(fill = Cell)) +
+  coord_flip() +
+  scale_color_brewer(palette = "Set2") +
+  scale_fill_brewer(palette = "Set2") +  # for the point fills
+  labs(
+    title = "Distribution of each cell type across samples",
+    x     = NULL, 
+    y     = "Fraction"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.y     = element_text(size = 10, face = "bold"),
+    axis.title.x     = element_text(face = "bold"),
+    plot.title      = element_text(hjust = 0.5)
+  )
+  
+  
+
+#############################################################
+## 2. Compositional transform (CLR) & correlation heatmap  ##
+#############################################################
+
+# replace zeros (needed before clr) – multiplicative replacement
+library(zCompositions)
+
+frac_t_mr   <- zCompositions::cmultRepl(frac_t, label = 0, method = "CZM")  
+clr_mat   <- clr(frac_t_mr)      
+
+dim(clr_mat)
+
+# correlation of clr values
+corr <- cor(clr_mat)
+pheatmap(corr,
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         color = colorRampPalette(c("#c51b7d", "white", "#4d9221"))(100),
+         main = "CLR-based correlation between cell types")
+
+#############################################################
+##  3.  PCA + unsupervised clustering                      ##
+#############################################################
+
+pca <- PCA(clr_mat, graph = FALSE)
+fviz_eig(pca, addlabels = TRUE, barfill = "steelblue") +
+  ggtitle("Variance explained")
+
+# choose k via silhouette width on first 5 PCs
+pc_scores <- pca$ind$coord[, 1:5]
+sil_widths <- sapply(2:7, function(k) {
+  pam(pc_scores, k)$silinfo$avg.width
+})
+(k_opt <- which.max(sil_widths) + 1)   # pick the best k
+
+clusters <- pam(pc_scores, k_opt)$clustering
+
+fviz_pca_ind(pca,
+             geom.ind  = "point",
+             col.ind   = factor(clusters),
+             palette   = "Dark2",
+             addEllipses = TRUE,
+             legend.title = "Cluster") +
+  ggtitle("PCA of CLR-fractions (ellipses = clusters)")
+
+#############################################################
+##  5.  UMAP (for non-linear clustering)                   ##
+#############################################################
+
+set.seed(123)
+Xclr_mat <- as.matrix(clr_mat) 
+umap_res <- umap(Xclr_mat)
+
+df_umap  <- data.frame(UMAP1 = umap_res$layout[, 1],
+                       UMAP2 = umap_res$layout[, 2],
+                       Cluster = factor(clusters))
+
+ggplot(df_umap, aes(UMAP1, UMAP2, color = Cluster)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(
+    aes(fill = Cluster),          # also fill the ellipse
+    geom    = "polygon",          # draw as a filled polygon
+    alpha   = 0.1,                # transparency
+    color   = NA,                 # no border
+    level   = 0.95                # 95% confidence ellipse
+  ) +
+  scale_color_brewer(palette = "Set1") +
+  scale_fill_brewer(palette  = "Set1") +
+  theme_bw() +
+  labs(title = "UMAP of samples (CLR space)")
+
+#############################################################
+##  5.  Sample-level diversity indices                     ##
+#############################################################
+
+shannon <- vegan::diversity(frac_t, index = "shannon")   # vegan
+
+# relate entropy to clusters
+# define the pair to compare
+my_comparisons <- list(c("1", "2"))
+
+df_entropy <- tibble(
+  Shannon = shannon,
+  Cluster = factor(clusters)
+)
+
+ggplot(df_entropy, aes(x = Cluster, y = Shannon, color = Cluster)) +
+  # half‐violin on right
+  geom_half_violin(
+    side      = "r",
+    trim      = FALSE,
+    fill      = NA,
+    linewidth = 1,
+    alpha     = 0.4
+  ) +
+  # boxplot outline
+  geom_boxplot(
+    width         = 0.1,
+    fill          = NA,
+    outlier.shape = NA,
+    linewidth     = 1,
+    alpha = 1
+  ) +
+  # jittered points
+  geom_jitter(
+    width  = 0.15,
+    size   = 2,
+    alpha  = 0.5
+  ) +
+  # custom cluster colors
+  scale_color_manual(values = c("1" = "#35978f", "2" = "#bf812d")) +
+  # draw the bracket and p‐value
+  stat_compare_means(
+    comparisons  = my_comparisons,    # which groups to compare
+    method       = "wilcox.test",
+    label        = "p.format",        # formatted p‐value
+    tip.length   = 0.02,              # length of the little “tees”
+    bracket.size = 0.8,               # thickness of the bar
+    label.y      = max(df_entropy$Shannon) * 1.05  # put text just above the tallest point
+  ) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Shannon Entropy per Cluster",
+    x     = "Cluster",
+    y     = "Shannon Entropy"
+  ) +
+  theme(
+    legend.position = "none",
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    axis.title.y    = element_text(face = "bold")
+  )
+
+#############################################################
+##  6.  Elucidating the clusters                             ##
+#############################################################
+
+X <- frac_t
+
+# after PAM or k-means:
+clusters <- pam(pc_scores, k_opt)$clustering
+
+mean_by_cl <- X %>%
+  as.data.frame() %>%
+  mutate(Cluster = clusters ) %>%
+  group_by(Cluster) %>%
+  summarise(across(everything(), mean)) %>%
+  pivot_longer(-Cluster, names_to = "Cell", values_to = "MeanFrac")
+
+my_cols <- c(
+  "1" = "#35978f",   # cluster 1
+  "2" = "#bf812d"    # cluster 2
+)
+
+mean_by_cl_c <- mean_by_cl %>%
+  mutate(Cluster = factor(Cluster, levels = c(1,2),
+                          labels = c("Cluster 1","Cluster 2")))
+
+ggplot(mean_by_cl_c, aes(Cell, MeanFrac, fill = Cluster)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(
+    values = c("Cluster 1" = "#35978f", "Cluster 2" = "#bf812d")
+  ) +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    title = "Average cell-type fraction per cluster",
+    x     = NULL,
+    y     = "Mean Fraction"
+  ) +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+     axis.text.y     = element_text(face = "bold"),  # ← bold tick labels
+    axis.title.y    = element_text(face = "bold"),   # ← bold axis title
+    legend.position = "right"
+  )
+
+#############################################################
+##  7.  Decision Tree for cluster elucidation              ##
+#############################################################
+df <- cbind(X, Cluster = clusters)
+df
+# X = samples × cell-types  (still a matrix)
+# cluster_id = vector of length nSamples with the PAM/k-means labels
+
+tree_df <- X |>
+  as.data.frame() |>                 # <- matrix ➜ data-frame
+  mutate(Cluster = factor(clusters))    # add the label column
+
+# now run rpart on the data-frame
+library(rpart)
+tree <- rpart(
+  Cluster ~ ., 
+  data    = tree_df,
+  method  = "class",
+  parms   = list(split = "information"),
+  control = rpart.control(cp = 0.01, minsplit = 5)
+)
+
+
+# Define a two-colour palette (one per cluster)
+my_palette <- c("#35978f", "#bf812d")
+
+rpart.plot(
+  tree,
+  type          = 4,      # label all nodes
+  extra         = 104,    # show class and prob info
+  fallen.leaves = TRUE,
+  
+  # --- NEW COLOUR OPTIONS ---
+  box.palette   = my_palette,   # fill colours for the node boxes
+  branch.col    = "darkgrey",   # branch line colour
+  shadow.col    = NA,           # remove box shadow
+  nn            = FALSE,         # display node numbers
+  tweak         = 1.2,          # scale up text slightly
+  
+  main = "Decision tree separating the two clusters"
+)
+
+```
+
+# Differential analysis
+
+## Gene annotation
+
+Two annotation manifests—HM450.hg38.manifest.gencode.v37.tsv.gz and EPIC.hg38.manifest.gencode.v37.tsv.gz—were used for gene annotation. Of the CpG sites in the bulk-sample dataset, 421 overlapped with the HM450 manifest and 444 overlapped with the EPIC manifest.
+
+```{r gene annot}
+annot<-readr::read_tsv("https://github.com/zhou-lab/InfiniumAnnotationV1/raw/main/Anno/HM450/HM450.hg38.manifest.gencode.v37.tsv.gz") %>%
+  dplyr::rename(Probe_ID=probeID)
+
+
+annot2<-readr::read_tsv("https://github.com/zhou-lab/InfiniumAnnotationV1/raw/main/Anno/EPIC/EPIC.hg38.manifest.gencode.v37.tsv.gz") %>%
+  dplyr::rename(Probe_ID=probeID)
+
+# checking the overlapping CpGs
+intersect <- intersect(bulk_sample$CpGs, annot$Probe_ID)
+length(intersect)
+
+```
+
+## Density plot - QC
+
+The β-value density plots across samples showed no obvious outliers, although a few curves deviated from the expected bimodal distribution. 
+The M-value density plots exhibited unusually peaks in some samples, which could reflect batch effects, different tissue origins, or variability in experimental quality or preprocessing.
+
+```{r QC}
+
+names(bulk_sample)[names(bulk_sample) == "CpGs"] <- "Probe_ID"
+meth <- bulk_sample
+rownames(meth) <- meth$Probe_ID
+meth <- meth[ , -1]
+dim(meth)
+meth <- as.matrix(meth)
+
+n <- ncol(meth)             
+
+densityPlot(
+  meth,
+  sampGroups = colnames(meth),        # one group label per sample
+  sampNames  = colnames(meth),        # put sample names in the legend
+  pal        = rainbow(n),            # <- now a colour *vector*
+  legend     = FALSE,                 # draw your own if you wish
+  xlab       = expression(beta~value),
+  main       = "Density of β values per sample"
+)
+
+```
+
+## Filter NA CpG
+
+To improve the power of downstream analyses, CpG probes with missing data in ≥ 20% of samples were filtered out.
+
+```{r Filtering}
+
+# 1. choose the NA-threshold
+na_cutoff <- 0.20             
+
+# 2. calculate the fraction of NA in each probe (row)
+na_frac <- rowMeans(is.na(meth))
+
+# 3. keep rows where that fraction ≤ threshold
+beta_filt <- meth[ na_frac <= na_cutoff , ]
+
+# 4. (optional) report how many probes you kept / removed
+cat(
+  sprintf("Kept %s of %s probes (%.1f %%); removed %s (%.1f %%)\n",
+          nrow(beta_filt), length(na_frac),
+          100 * nrow(beta_filt) / length(na_frac),
+          sum(na_frac > na_cutoff),
+          100 * sum(na_frac > na_cutoff) / length(na_frac))
+)
+
+```
+
+## Convert to M-value
+
+```{r Mval}
+
+methM <- beta2m(meth) 
+n <- ncol(methM)                      
+
+densityPlot(
+  methM,
+  sampGroups = colnames(methM),       
+  sampNames  = colnames(methM),     
+  pal        = rainbow(n),             
+  legend     = FALSE,                   
+  xlab       = "M value",
+  main       = "Density of M values per sample"
+)
+```
+
+## Create SummarizedExperiment object
+
+```{r SE}
+# probes:
+
+key <- "Probe_ID"                           
+anno_df <- annot[, c(key, setdiff(names(annot), key))]
+
+## --- 3.  produce a complete row-annotation table (same order as methM) ------
+all_probes <- rownames(methM)
+
+row_df <- anno_df[ match(all_probes, annot[[key]]), ]   # keeps order of methM
+
+row_df <- as.data.frame(row_df)
+
+rownames(row_df) <- all_probes  
+
+table(complete.cases(row_df))
+
+# samples:
+stopifnot(all(colnames(methM) %in% rownames(df)))
+col_df <- df[ match(colnames(methM), rownames(df)), ]
+
+se <- SummarizedExperiment(
+  assays  = list(Mvalue = methM),
+  colData = DataFrame(col_df),      # your sample metadata (clusters, etc.)
+  rowData = DataFrame(row_df)       # annotation + NA rows
+)
+
+se
+
+```
+
+## DMP findings
+
+To investigate the differences of DNA methylation profiles between 2 clusters, linear regression model with limma was fitted with empirical Bayes method to moderate the standard errors of the estimated log-fold changes. 
+
+The top differentially methylated CpG sites (FDR-adjusted) were then visualized with volcano plots.
+
+```{r DMP}
+#############################################################
+##  0.  Setup                                              ##
+#############################################################
+
+m_mat   <- assay(se, "Mvalue")        
+clusters <- factor(se$Cluster)            
+table(clusters)                     
+
+#############################################################
+##  1.  Design & contrasts                                 ##
+#############################################################
+
+design <- model.matrix(~ 0 + clusters)     # no intercept: one column per group
+colnames(design) <- levels(clusters)       # e.g. "1"  "2"
+
+colnames(design) <- c("Cluster1", "Cluster2")
+contrast.mat <- makeContrasts(
+  diff = Cluster2 - Cluster1,    # Cluster 2 minus Cluster 1
+  levels = design
+)
+
+#############################################################
+##  2.  Fit the linear model                               ##
+#############################################################
+
+fit  <- lmFit(m_mat, design)
+fit2 <- contrasts.fit(fit, contrast.mat)
+fit2 <- eBayes(fit2)
+
+#############################################################
+##  3.  Extract results                                    ##
+#############################################################
+
+top <- topTable(
+  fit2,
+  coef      = "diff",          # the contrast we named above
+  number    = Inf,             # all probes
+  sort.by   = "P",
+  adjust    = "BH"             # FDR
+)
+
+# quick overview
+head(top[, c("logFC", "AveExpr", "t", "P.Value", "adj.P.Val")])
+
+# how many genome-wide significant?
+sum(top$adj.P.Val < 0.05)
+
+# add annotation columns if you stored them in rowData(se)
+top_anno <- cbind(
+  rowData(se)[rownames(top), ],  # annotation
+  top                                # statistics
+)
+
+dim(top_anno)
+#############################################################
+##  4.  Save & plot                                         ##
+#############################################################
+
+write.csv(top_anno, "DMPs_Cluster2_vs_Cluster1.csv", row.names = FALSE)
+
+# Volcano
+top_anno <- as.data.frame(top_anno)
+## 1 ──────────────────────────────────────────────────────────
+##  Classify each CpG for colour & label
+## ────────────────────────────────────────────────────────────
+volc <- top_anno %>%
+  mutate(
+    negLog10FDR = -log10(adj.P.Val),
+    absLFC      = abs(logFC),
+    class = case_when(
+      adj.P.Val < 0.05 & absLFC >= 1        ~ "FDR<0.05 & |LFC|≥1",
+      adj.P.Val < 0.05 & absLFC >= 0.5      ~ "FDR<0.05 & 0.5≤|LFC|<1",
+      adj.P.Val < 0.05 & absLFC < 0.5       ~ "FDR>0.05",
+      TRUE ~ "NS"
+    )
+  )
+
+##  colour palette
+my_cols <- c(
+  "FDR<0.05 & |LFC|≥1"   = "#01665e",   # red
+  "FDR<0.05 & 0.5≤|LFC|<1" = "#35978f", # blue
+  "FDR>0.05"             = "#80cdc1",
+  "NS" = "grey"
+)
+
+label_df <- volc %>%
+  filter(adj.P.Val < 0.05) %>%                # only significant ones
+  group_by(direction = sign(logFC)) %>%       # -1 = hypo, 1 = hyper
+  slice_min(order_by = adj.P.Val, n = 15) %>%  # 5 per direction
+  ungroup()
+
+## 2 ──────────────────────────────────────────────────────────
+##  Volcano plot
+## ────────────────────────────────────────────────────────────
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+ggplot(volc, aes(x = logFC, y = negLog10FDR, colour = class)) +
+  geom_point(size = 1.3, alpha = 0.8) +
+  scale_colour_manual(values = my_cols, name = NULL) +
+  
+  ## threshold lines
+  geom_vline(xintercept = c(-1, 1),  linetype = "dashed", colour = "#543005") +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", colour = "#8c510a") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dotted", colour = "#b2182b") +
+  geom_text_repel(
+    data        = label_df,
+    aes(label = genesUniq), 
+    colour      = "#8e0152",    
+    max.overlaps = Inf,
+    size         = 3,
+    segment.size = 0.3,
+    box.padding  = 0.8,
+    point.padding= 0.6,
+    force = 1.5,
+    seed         = 123
+  ) +
+  
+  ## aesthetics
+  labs(
+    title    = "Volcano plot – Cluster 2 vs Cluster 1",
+    x        = expression(log[2]~fold~change~(M~value)),
+    y        = expression(-log[10]~FDR)
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title      = element_text(hjust = .5, face = "bold"),
+    legend.position = "none"
+  )
+
+```
+
+
+## DMR findings
+
+Differentially methylated regions between Cluster 1 and Cluster 2 were identified using the DMRcate package.
+
+```{r DMR}
+
+# DMR finding with DMRcate
+## DMR analysis manually
+  
+contrast.mat <- limma::makeContrasts(Cluster2 - Cluster1, levels = design)
+myannotation <- cpg.annotate(
+  datatype      = "array",  
+  what = "M", 
+  object        = methM,               # M-value matrix (CpGs × samples)
+  design        = design,          # model matrix with your Cluster column
+  analysis.type = "differential",
+  contrasts     = TRUE,
+  cont.matrix   = contrast.mat, 
+  coef = "Cluster2 - Cluster1",
+  arraytype     = "450K"           # or "450K"
+)
+
+dmrcoutput<- DMRcate::dmrcate(myannotation,C=2, pcutoff=0.05, lambda = 1000)
+
+
+dmr_table <- DMRcate::extractRanges(dmrcoutput, genome = "hg38")
+
+```
+
+## Circosplot
+
+A circos plot was used to visualize the chromosomal distribution of differentially methylated positions (DMPs).
+
+```{r Circo}
+
+results <- top_anno %>%
+  mutate(deltaBeta = 2^(logFC/2) / (1 + 2^(logFC/2)) -
+                     2^(-logFC/2) / (1 + 2^(-logFC/2)))
+
+## 2.  merge so we have chr, pos, deltaBeta
+res_annot <- results %>%
+        filter(!is.na(Probe_ID))               # keep only mapped probes
+res_annot <- res_annot[res_annot$adj.P.Val < 0.05, ]
+dim(res_annot)
+## 3.  build GRanges with the required metadata slots ------------------------
+ranges <- GRanges(
+  seqnames = res_annot$CpG_chrm,
+  ranges   = IRanges(start = res_annot$CpG_beg,
+                     end   = res_annot$CpG_end),       # CpGs: single-bp
+  deltabetas = res_annot$deltaBeta,
+  midpoint   = res_annot$CpG_beg                       # single-point so start==midpoint
+)
+
+## 4.  draw the circos plot ---------------------------------------------------
+p <- circosplot(ranges, genome = "hg38")
+print(p)
+
+```
+
